@@ -1081,6 +1081,99 @@ void fill_vm_counters( VM_COUNTERS_EX *pvmi, int unix_pid )
         ret = STATUS_INVALID_INFO_CLASS; \
         break
 
+/* Obtain a real server snapshot, then select only the authorized process.
+ * No server protocol change is needed. The server returns an atomic snapshot
+ * or BUFFER_TOO_SMALL; retry growth rather than silently dropping handles. */
+static NTSTATUS query_process_handles_snapshot( HANDLE process, HANDLE internal_handle, BOOL table,
+                                                ULONG *handles, ULONG capacity, ULONG *count )
+{
+    struct handle_info *entries, *new_entries;
+    unsigned int pid, total, bytes = 256 * sizeof(*entries), i;
+    NTSTATUS status;
+
+    SERVER_START_REQ( get_process_info )
+    {
+        req->handle = wine_server_obj_handle( process );
+        status = wine_server_call( req );
+        pid = reply->pid;
+    }
+    SERVER_END_REQ;
+    if (status) return status; /* validates process type and QUERY_LIMITED_INFORMATION */
+
+    if (table && process != NtCurrentProcess())
+    {
+        OBJECT_BASIC_INFORMATION basic;
+        const ACCESS_MASK access = PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE;
+        if ((status = NtQueryObject( process, ObjectBasicInformation, &basic, sizeof(basic), NULL )))
+            return status;
+        if ((basic.GrantedAccess & access) != access) return STATUS_ACCESS_DENIED;
+    }
+
+    if (!(entries = malloc( bytes ))) return STATUS_NO_MEMORY;
+    for (;;)
+    {
+        SERVER_START_REQ( get_system_handles )
+        {
+            wine_server_set_reply( req, entries, bytes );
+            status = wine_server_call( req );
+            total = reply->count;
+        }
+        SERVER_END_REQ;
+        if (status != STATUS_BUFFER_TOO_SMALL) break;
+        if (total > UINT_MAX / sizeof(*entries) / 2)
+        {
+            free( entries );
+            return STATUS_NO_MEMORY;
+        }
+        bytes = max( total, 1 ) * sizeof(*entries) * 2;
+        if (!(new_entries = realloc( entries, bytes )))
+        {
+            free( entries );
+            return STATUS_NO_MEMORY;
+        }
+        entries = new_entries;
+    }
+    if (!status)
+    {
+        *count = 0;
+        for (i = 0; i < total; ++i)
+        {
+            if (entries[i].owner != pid) continue;
+            /* Do not expose the private reference acquired for this query. */
+            if (pid == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) &&
+                entries[i].handle == wine_server_obj_handle( internal_handle )) continue;
+            /* Compact in-place, behind the iterator, before touching user memory. */
+            if (table && *count < capacity) ((ULONG *)entries)[*count] = entries[i].handle;
+            ++*count;
+        }
+        if (table && *count && capacity &&
+            virtual_uninterrupted_write_memory( handles, entries, min( *count, capacity ) * sizeof(ULONG) ))
+            status = STATUS_ACCESS_VIOLATION;
+    }
+    free( entries );
+    return status;
+}
+
+static NTSTATUS query_process_handles( HANDLE process, BOOL table, ULONG *handles,
+                                       ULONG capacity, ULONG *count )
+{
+    HANDLE reference;
+    NTSTATUS status;
+
+    if (process == NtCurrentProcess())
+        return query_process_handles_snapshot( process, NULL, table, handles, capacity, count );
+
+    /* Pin both identity and granted access across the separate server calls.
+     * SAME_ACCESS is essential: requesting new access could upgrade a weak
+     * handle based on the object's DACL, which this query must not do. */
+    status = NtDuplicateObject( NtCurrentProcess(), process, NtCurrentProcess(),
+                                &reference, 0, 0, DUPLICATE_SAME_ACCESS );
+    if (status) return status;
+    status = query_process_handles_snapshot( reference, reference, table, handles, capacity, count );
+    NtClose( reference );
+    return status;
+}
+
 /**********************************************************************
  *           NtQueryInformationProcess  (NTDLL.@)
  */
@@ -1372,8 +1465,10 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
             else if (!handle) ret = STATUS_INVALID_HANDLE;
             else
             {
-                FIXME( "ProcessHandleCount (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
-                memset(info, 0, 4);
+                ULONG count;
+                ret = query_process_handles( handle, FALSE, NULL, 0, &count );
+                if (!ret && virtual_uninterrupted_write_memory( info, &count, sizeof(count) ))
+                    ret = STATUS_ACCESS_VIOLATION;
                 len = 4;
             }
             if (size > 4) ret = STATUS_INFO_LENGTH_MISMATCH;
@@ -1386,8 +1481,13 @@ NTSTATUS WINAPI NtQueryInformationProcess( HANDLE handle, PROCESSINFOCLASS class
         break;
 
     case ProcessHandleTable:
-        FIXME( "ProcessHandleTable (%p,%p,0x%08x,%p) stub\n", handle, info, size, ret_len );
-        len = 0;
+        {
+            ULONG count;
+            if (size && !info) return STATUS_ACCESS_VIOLATION;
+            ret = query_process_handles( handle, TRUE, info, size / sizeof(ULONG), &count );
+            /* Windows returns only as many ULONG handles as fit, successfully. */
+            if (!ret) len = min( count, size / sizeof(ULONG) ) * sizeof(ULONG);
+        }
         break;
 
     case ProcessAffinityMask:
