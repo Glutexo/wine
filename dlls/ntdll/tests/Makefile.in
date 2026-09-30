@@ -17,6 +17,7 @@ SOURCES = \
 	path.c \
 	pipe.c \
 	port.c \
+	process_handle.c \
 	reg.c \
 	rtl.c \
 	rtlbitmap.c \
