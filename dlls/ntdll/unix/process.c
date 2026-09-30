@@ -1125,7 +1125,7 @@ static NTSTATUS query_process_handles_snapshot( HANDLE process, HANDLE internal_
             free( entries );
             return STATUS_NO_MEMORY;
         }
-        bytes = max( total, 1 ) * sizeof(*entries) * 2;
+        bytes = total * sizeof(*entries) * 2;
         if (!(new_entries = realloc( entries, bytes )))
         {
             free( entries );
